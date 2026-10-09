@@ -27,57 +27,81 @@ export async function getOrStartServer(
     return servers.get(key);
   }
 
-  try {
-    const child = spawn(def.server, def.args, {
-      cwd,
-      stdio: ["pipe", "pipe", "ignore"],
-    });
+  return new Promise((resolve) => {
+    let resolved = false;
 
-    const active: ActiveServer = {
-      process: child,
-      def,
-      requestId: 1,
-      pendingRequests: new Map(),
-      diagnostics: new Map(),
-      buffer: "",
-    };
+    try {
+      const child = spawn(def.server, def.args, {
+        cwd,
+        stdio: ["pipe", "pipe", "ignore"],
+      });
 
-    child.stdout?.on("data", (chunk: Buffer) => {
-      active.buffer += chunk.toString("utf8");
-      const msgs = parseRpcMessages(active.buffer);
-      for (const msg of msgs) {
-        if (msg.id !== undefined && active.pendingRequests.has(Number(msg.id))) {
-          const cb = active.pendingRequests.get(Number(msg.id))!;
-          active.pendingRequests.delete(Number(msg.id));
-          cb(msg.result ?? msg.error);
+      const active: ActiveServer = {
+        process: child,
+        def,
+        requestId: 1,
+        pendingRequests: new Map(),
+        diagnostics: new Map(),
+        buffer: "",
+      };
+
+      child.on("error", () => {
+        servers.delete(key);
+        for (const cb of active.pendingRequests.values()) {
+          cb(null);
         }
-        // Handle publishDiagnostics notification
-        if (msg.method === "textDocument/publishDiagnostics") {
-          const uri = msg.params?.uri;
-          const diags = msg.params?.diagnostics ?? [];
-          if (uri) {
-            active.diagnostics.set(uri, diags);
+        active.pendingRequests.clear();
+        if (!resolved) {
+          resolved = true;
+          resolve(undefined);
+        }
+      });
+
+      child.stdout?.on("data", (chunk: Buffer) => {
+        active.buffer += chunk.toString("utf8");
+        const msgs = parseRpcMessages(active.buffer);
+        for (const msg of msgs) {
+          if (msg.id !== undefined && active.pendingRequests.has(Number(msg.id))) {
+            const cb = active.pendingRequests.get(Number(msg.id))!;
+            active.pendingRequests.delete(Number(msg.id));
+            cb(msg.result ?? msg.error);
+          }
+          // Handle publishDiagnostics notification
+          if (msg.method === "textDocument/publishDiagnostics") {
+            const uri = msg.params?.uri;
+            const diags = msg.params?.diagnostics ?? [];
+            if (uri) {
+              active.diagnostics.set(uri, diags);
+            }
           }
         }
+      });
+
+      child.on("close", () => {
+        servers.delete(key);
+      });
+
+      // Send initialize request
+      sendNotification(active, "initialize", {
+        processId: process.pid,
+        rootUri: `file://${cwd}`,
+        capabilities: {},
+      });
+
+      process.nextTick(() => {
+        if (!resolved) {
+          resolved = true;
+          servers.set(key, active);
+          resolve(active);
+        }
+      });
+    } catch {
+      if (!resolved) {
+        resolved = true;
+        resolve(undefined);
       }
-    });
-
-    child.on("close", () => {
-      servers.delete(key);
-    });
-
-    // Send initialize request
-    sendNotification(active, "initialize", {
-      processId: process.pid,
-      rootUri: `file://${cwd}`,
-      capabilities: {},
-    });
-
-    servers.set(key, active);
-    return active;
-  } catch {
-    return undefined;
-  }
+    }
+  });
 }
 
 function sendNotification(server: ActiveServer, method: string, params: any) {
@@ -86,7 +110,9 @@ function sendNotification(server: ActiveServer, method: string, params: any) {
     method,
     params,
   };
-  server.process.stdin?.write(encodeRpcMessage(msg));
+  try {
+    server.process.stdin?.write(encodeRpcMessage(msg));
+  } catch {}
 }
 
 export function sendLspRequest(
@@ -114,7 +140,13 @@ export function sendLspRequest(
       resolve(res);
     });
 
-    server.process.stdin?.write(encodeRpcMessage(msg));
+    try {
+      server.process.stdin?.write(encodeRpcMessage(msg));
+    } catch {
+      clearTimeout(timer);
+      server.pendingRequests.delete(id);
+      resolve(null);
+    }
   });
 }
 
