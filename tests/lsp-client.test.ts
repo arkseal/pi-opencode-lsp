@@ -1,6 +1,14 @@
 import { describe, expect, it } from "bun:test";
 import { formatDiagnostic, formatLspResult, translatePosition } from "../src/lsp-formatter";
 import { encodeRpcMessage, parseRpcMessages, parseRpcBuffer } from "../src/json-rpc";
+import {
+  normalizeFilePath,
+  toFileUri,
+  sendLspRequest,
+  shutdownAllServers,
+  type ActiveServer,
+} from "../src/lsp-client";
+import { EventEmitter } from "node:events";
 
 describe("LSP Client & Formatter", () => {
   it("translates 1-based editor coordinates to 0-based LSP coordinates", () => {
@@ -92,5 +100,88 @@ describe("LSP Client & Formatter", () => {
     const result = formatLspResult("findReferences", locations, "/project");
     expect(result).toContain("src/auth.ts:25:5");
     expect(result).toContain("src/index.ts:6:3");
+  });
+
+  it("formats single definition location correctly", () => {
+    const singleLoc = {
+      uri: "file:///project/src/models/user.ts",
+      range: { start: { line: 10, character: 2 }, end: { line: 10, character: 10 } },
+    };
+    const result = formatLspResult("goToDefinition", singleLoc, "/project");
+    expect(result).toBe("goToDefinition found 1 location:\n  - src/models/user.ts:11:3");
+  });
+
+  it("formats workspace symbols with relative path and container name", () => {
+    const symbols = [
+      {
+        name: "authenticate",
+        containerName: "AuthService",
+        location: {
+          uri: "file:///project/src/auth/service.ts",
+          range: { start: { line: 42, character: 2 }, end: { line: 42, character: 14 } },
+        },
+      },
+    ];
+
+    const result = formatLspResult("workspaceSymbol", symbols, "/project");
+    expect(result).toContain("Workspace symbols (1):");
+    expect(result).toContain("authenticate [AuthService] (src/auth/service.ts:43)");
+  });
+
+  it("bounds output size when result is extremely large", () => {
+    const hugeHover = {
+      contents: "x".repeat(10000),
+    };
+
+    const result = formatLspResult("hover", hugeHover, "/project");
+    expect(result.length).toBeLessThanOrEqual(8100);
+    expect(result).toContain("output truncated to stay within token limits");
+  });
+
+  it("normalizes paths by stripping leading @ and resolving relative paths", () => {
+    const cwd = "/workspace/project";
+    expect(normalizeFilePath("@src/app.ts", cwd)).toBe("/workspace/project/src/app.ts");
+    expect(normalizeFilePath("src/app.ts", cwd)).toBe("/workspace/project/src/app.ts");
+    expect(normalizeFilePath("/absolute/path/file.ts", cwd)).toBe("/absolute/path/file.ts");
+    expect(toFileUri("/workspace/project/src/app.ts")).toBe("file:///workspace/project/src/app.ts");
+  });
+
+  it("aborts sendLspRequest when AbortSignal is cancelled", async () => {
+    const mockStdin = new EventEmitter() as any;
+    mockStdin.writable = true;
+    mockStdin.write = () => true;
+
+    const mockChild = new EventEmitter() as any;
+    mockChild.stdin = mockStdin;
+    mockChild.killed = false;
+
+    const mockServer: ActiveServer = {
+      key: "test",
+      process: mockChild,
+      def: { server: "test", args: [] },
+      requestId: 10,
+      pendingRequests: new Map(),
+      diagnostics: new Map(),
+      buffer: Buffer.alloc(0),
+      initialized: true,
+    };
+
+    const controller = new AbortController();
+    const reqPromise = sendLspRequest(
+      mockServer,
+      "textDocument/hover",
+      {},
+      { timeoutMs: 2000, signal: controller.signal }
+    );
+
+    expect(mockServer.pendingRequests.size).toBe(1);
+    controller.abort();
+
+    await expect(reqPromise).rejects.toThrow("LSP request cancelled");
+    expect(mockServer.pendingRequests.size).toBe(0);
+  });
+
+  it("shuts down all active servers gracefully", async () => {
+    await shutdownAllServers();
   });
 });

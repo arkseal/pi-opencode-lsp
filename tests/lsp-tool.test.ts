@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as os from "node:os";
 import { resolveLspServerCommand } from "../src/server-config";
 import { appendDiagnosticsToEditResult } from "../src/post-edit-diagnostics";
+import opencodeLspExtension from "../src/index";
 
 describe("LSP Tool & Post-Edit Hook", () => {
   let tempDir: string;
@@ -36,9 +37,69 @@ describe("LSP Tool & Post-Edit Hook", () => {
     expect(result).toContain("Line 12:8 [Error]");
   });
 
+  it("bounds diagnostics reporting to 20 items with overflow count", () => {
+    const originalOutput = "Edited src/app.ts";
+    const manyDiags = Array.from({ length: 35 }, (_, i) => `Line ${i + 1}:1 [Error]: Syntax error ${i}`);
+
+    const result = appendDiagnosticsToEditResult(originalOutput, "src/app.ts", manyDiags);
+    expect(result).toContain("Line 20:1 [Error]");
+    expect(result).not.toContain("Line 21:1 [Error]");
+    expect(result).toContain("... and 15 more diagnostic(s)");
+  });
+
   it("leaves output untouched when zero diagnostics exist", () => {
     const originalOutput = "Successfully applied edits to src/auth.ts";
     const result = appendDiagnosticsToEditResult(originalOutput, "src/auth.ts", []);
     expect(result).toBe(originalOutput);
+  });
+
+  it("registers extension tool, shutdown handler, and tool_result hook", async () => {
+    let registeredTool: any = null;
+    const eventHandlers = new Map<string, Function>();
+
+    const mockPi: any = {
+      registerTool(tool: any) {
+        registeredTool = tool;
+      },
+      on(event: string, handler: Function) {
+        eventHandlers.set(event, handler);
+      },
+    };
+
+    opencodeLspExtension(mockPi);
+
+    expect(registeredTool).not.toBeNull();
+    expect(registeredTool.name).toBe("lsp");
+    expect(registeredTool.promptGuidelines).toBeDefined();
+    expect(registeredTool.promptGuidelines[0]).toContain("Use lsp");
+
+    // Execute with unknown file type should return error with isError: true
+    const errorResult = await registeredTool.execute(
+      "call-1",
+      { operation: "hover", filePath: "unknown.xyz" },
+      undefined,
+      undefined,
+      { cwd: tempDir }
+    );
+    expect(errorResult.isError).toBe(true);
+    expect(errorResult.content[0].text).toContain("LSP error:");
+
+    // tool_result hook ignores errored tool results
+    const toolResultHandler = eventHandlers.get("tool_result")!;
+    const ignoredRes = await toolResultHandler(
+      {
+        toolName: "edit",
+        isError: true,
+        input: { path: "src/auth.ts" },
+        content: [{ type: "text", text: "Failed edit" }],
+      },
+      { cwd: tempDir }
+    );
+    expect(ignoredRes).toBeUndefined();
+
+    // session_shutdown handler cleans up
+    const shutdownHandler = eventHandlers.get("session_shutdown")!;
+    expect(shutdownHandler).toBeDefined();
+    await shutdownHandler();
   });
 });

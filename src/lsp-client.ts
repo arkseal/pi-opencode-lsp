@@ -1,34 +1,101 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import * as path from "node:path";
-import { encodeRpcMessage, parseRpcMessages, type JsonRpcMessage } from "./json-rpc.js";
+import { pathToFileURL } from "node:url";
+import { encodeRpcMessage, parseRpcBuffer, type JsonRpcMessage } from "./json-rpc.js";
 import { resolveLspServerCommand, type LspServerDef } from "./server-config.js";
 import { translatePosition, type EditorPosition, type LspDiagnostic, formatDiagnostic } from "./lsp-formatter.js";
 
-interface ActiveServer {
+export interface PendingRequest {
+  resolve: (res: any) => void;
+  reject: (err: any) => void;
+  timer: NodeJS.Timeout;
+}
+
+export interface ActiveServer {
+  key: string;
   process: ChildProcess;
   def: LspServerDef;
   requestId: number;
-  pendingRequests: Map<number, (res: any) => void>;
+  pendingRequests: Map<number, PendingRequest>;
   diagnostics: Map<string, LspDiagnostic[]>;
-  buffer: string;
+  buffer: Buffer;
+  initialized: boolean;
 }
 
 const servers = new Map<string, ActiveServer>();
+const pendingStarts = new Map<string, Promise<ActiveServer | undefined>>();
+
+export function normalizeFilePath(filePath: string, cwd: string): string {
+  const stripped = filePath.startsWith("@") ? filePath.slice(1) : filePath;
+  return path.isAbsolute(stripped) ? stripped : path.resolve(cwd, stripped);
+}
+
+export function toFileUri(filePath: string): string {
+  return pathToFileURL(filePath).href;
+}
+
+export function getActiveServersCount(): number {
+  return servers.size;
+}
+
+function cleanupServer(key: string, active: ActiveServer) {
+  servers.delete(key);
+  for (const pending of active.pendingRequests.values()) {
+    clearTimeout(pending.timer);
+    pending.resolve(null);
+  }
+  active.pendingRequests.clear();
+}
 
 export async function getOrStartServer(
   filePath: string,
-  cwd: string
+  cwd: string,
+  options?: { timeoutMs?: number; signal?: AbortSignal }
 ): Promise<ActiveServer | undefined> {
   const def = resolveLspServerCommand(filePath);
   if (!def) return undefined;
 
   const key = `${def.server}:${cwd}`;
-  if (servers.has(key)) {
-    return servers.get(key);
+  const existing = servers.get(key);
+  if (existing && !existing.process.killed) {
+    return existing;
   }
 
-  return new Promise((resolve) => {
+  // Deduplicate concurrent startup attempts for the same server & directory
+  const inflight = pendingStarts.get(key);
+  if (inflight) {
+    return inflight;
+  }
+
+  const startPromise = startServer(key, def, cwd, options?.timeoutMs ?? 8000);
+  pendingStarts.set(key, startPromise);
+
+  try {
+    const server = await startPromise;
+    if (server) {
+      servers.set(key, server);
+    }
+    return server;
+  } finally {
+    pendingStarts.delete(key);
+  }
+}
+
+async function startServer(
+  key: string,
+  def: LspServerDef,
+  cwd: string,
+  initTimeoutMs: number
+): Promise<ActiveServer | undefined> {
+  return new Promise<ActiveServer | undefined>((resolve) => {
     let resolved = false;
+
+    const safeResolve = (val: ActiveServer | undefined) => {
+      if (!resolved) {
+        resolved = true;
+        resolve(val);
+      }
+    };
 
     try {
       const child = spawn(def.server, def.args, {
@@ -37,35 +104,46 @@ export async function getOrStartServer(
       });
 
       const active: ActiveServer = {
+        key,
         process: child,
         def,
         requestId: 1,
         pendingRequests: new Map(),
         diagnostics: new Map(),
-        buffer: "",
+        buffer: Buffer.alloc(0),
+        initialized: false,
       };
 
       child.on("error", () => {
-        servers.delete(key);
-        for (const cb of active.pendingRequests.values()) {
-          cb(null);
-        }
-        active.pendingRequests.clear();
-        if (!resolved) {
-          resolved = true;
-          resolve(undefined);
-        }
+        cleanupServer(key, active);
+        safeResolve(undefined);
+      });
+
+      child.on("close", () => {
+        cleanupServer(key, active);
+        safeResolve(undefined);
       });
 
       child.stdout?.on("data", (chunk: Buffer) => {
-        active.buffer += chunk.toString("utf8");
-        const msgs = parseRpcMessages(active.buffer);
-        for (const msg of msgs) {
-          if (msg.id !== undefined && active.pendingRequests.has(Number(msg.id))) {
-            const cb = active.pendingRequests.get(Number(msg.id))!;
-            active.pendingRequests.delete(Number(msg.id));
-            cb(msg.result ?? msg.error);
+        active.buffer = Buffer.concat([active.buffer, chunk]);
+        const { messages, remainder } = parseRpcBuffer(active.buffer);
+        active.buffer = remainder;
+
+        for (const msg of messages) {
+          if (msg.id !== undefined) {
+            const reqId = Number(msg.id);
+            const pending = active.pendingRequests.get(reqId);
+            if (pending) {
+              active.pendingRequests.delete(reqId);
+              clearTimeout(pending.timer);
+              if (msg.error) {
+                pending.resolve(msg.error);
+              } else {
+                pending.resolve(msg.result);
+              }
+            }
           }
+
           // Handle publishDiagnostics notification
           if (msg.method === "textDocument/publishDiagnostics") {
             const uri = msg.params?.uri;
@@ -77,41 +155,57 @@ export async function getOrStartServer(
         }
       });
 
-      child.on("close", () => {
-        servers.delete(key);
-      });
-
-      // Send initialize request
-      sendNotification(active, "initialize", {
-        processId: process.pid,
-        rootUri: `file://${cwd}`,
-        capabilities: {},
-      });
-
-      process.nextTick(() => {
-        if (!resolved) {
-          resolved = true;
-          servers.set(key, active);
-          resolve(active);
-        }
-      });
+      // Send initialize request following standard LSP lifecycle
+      sendLspRequest(
+        active,
+        "initialize",
+        {
+          processId: process.pid,
+          rootUri: toFileUri(cwd),
+          capabilities: {
+            textDocument: {
+              definition: {},
+              references: {},
+              hover: { contentFormat: ["markdown", "plaintext"] },
+              documentSymbol: {},
+              implementation: {},
+            },
+            workspace: {
+              symbol: {},
+            },
+          },
+        },
+        { timeoutMs: initTimeoutMs }
+      )
+        .then((res) => {
+          if (!res && child.killed) {
+            safeResolve(undefined);
+            return;
+          }
+          // Send initialized notification as required by LSP specification
+          sendNotification(active, "initialized", {});
+          active.initialized = true;
+          safeResolve(active);
+        })
+        .catch(() => {
+          safeResolve(undefined);
+        });
     } catch {
-      if (!resolved) {
-        resolved = true;
-        resolve(undefined);
-      }
+      safeResolve(undefined);
     }
   });
 }
 
-function sendNotification(server: ActiveServer, method: string, params: any) {
+export function sendNotification(server: ActiveServer, method: string, params: any) {
   const msg: JsonRpcMessage = {
     jsonrpc: "2.0",
     method,
     params,
   };
   try {
-    server.process.stdin?.write(encodeRpcMessage(msg));
+    if (server.process.stdin?.writable) {
+      server.process.stdin.write(encodeRpcMessage(msg));
+    }
   } catch {}
 }
 
@@ -119,8 +213,15 @@ export function sendLspRequest(
   server: ActiveServer,
   method: string,
   params: any,
-  timeoutMs = 5000
+  options?: { timeoutMs?: number; signal?: AbortSignal }
 ): Promise<any> {
+  const timeoutMs = options?.timeoutMs ?? 5000;
+  const signal = options?.signal;
+
+  if (signal?.aborted) {
+    return Promise.reject(new Error("LSP request aborted"));
+  }
+
   const id = server.requestId++;
   const msg: JsonRpcMessage = {
     jsonrpc: "2.0",
@@ -129,25 +230,86 @@ export function sendLspRequest(
     params,
   };
 
-  return new Promise((resolve) => {
-    const timer = setTimeout(() => {
+  return new Promise((resolve, reject) => {
+    let onAbort: (() => void) | undefined;
+
+    const cleanup = () => {
+      clearTimeout(timer);
       server.pendingRequests.delete(id);
+      if (signal && onAbort) {
+        signal.removeEventListener("abort", onAbort);
+      }
+    };
+
+    const timer = setTimeout(() => {
+      cleanup();
       resolve(null);
     }, timeoutMs);
 
-    server.pendingRequests.set(id, (res) => {
-      clearTimeout(timer);
-      resolve(res);
+    if (signal) {
+      onAbort = () => {
+        cleanup();
+        sendNotification(server, "$/cancelRequest", { id });
+        reject(new Error("LSP request cancelled"));
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    server.pendingRequests.set(id, {
+      resolve: (res) => {
+        cleanup();
+        resolve(res);
+      },
+      reject: (err) => {
+        cleanup();
+        reject(err);
+      },
+      timer,
     });
 
     try {
-      server.process.stdin?.write(encodeRpcMessage(msg));
+      if (server.process.stdin?.writable) {
+        server.process.stdin.write(encodeRpcMessage(msg));
+      } else {
+        cleanup();
+        resolve(null);
+      }
     } catch {
-      clearTimeout(timer);
-      server.pendingRequests.delete(id);
+      cleanup();
       resolve(null);
     }
   });
+}
+
+export async function shutdownServer(server: ActiveServer): Promise<void> {
+  cleanupServer(server.key, server);
+
+  try {
+    if (server.process.stdin?.writable) {
+      await sendLspRequest(server, "shutdown", {}, { timeoutMs: 1000 });
+      sendNotification(server, "exit", {});
+    }
+  } catch {}
+
+  try {
+    if (!server.process.killed) {
+      server.process.kill("SIGTERM");
+      setTimeout(() => {
+        try {
+          if (!server.process.killed) {
+            server.process.kill("SIGKILL");
+          }
+        } catch {}
+      }, 300).unref();
+    }
+  } catch {}
+}
+
+export async function shutdownAllServers(): Promise<void> {
+  const all = Array.from(servers.values());
+  servers.clear();
+  pendingStarts.clear();
+  await Promise.all(all.map((s) => shutdownServer(s)));
 }
 
 export async function executeLspOperation(
@@ -155,60 +317,66 @@ export async function executeLspOperation(
   filePath: string,
   pos: EditorPosition,
   cwd: string,
-  query?: string
+  query?: string,
+  signal?: AbortSignal
 ): Promise<any> {
-  const server = await getOrStartServer(filePath, cwd);
+  if (signal?.aborted) {
+    throw new Error("LSP operation aborted");
+  }
+
+  const server = await getOrStartServer(filePath, cwd, { signal });
   if (!server) {
     throw new Error(`No LSP server available or installed for: ${path.basename(filePath)}`);
   }
 
-  const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-  const uri = `file://${absPath}`;
+  const absPath = normalizeFilePath(filePath, cwd);
+  const uri = toFileUri(absPath);
   const lspPos = translatePosition(pos);
+  const reqOpts = { signal };
 
   switch (operation) {
     case "goToDefinition":
       return sendLspRequest(server, "textDocument/definition", {
         textDocument: { uri },
         position: lspPos,
-      });
+      }, reqOpts);
     case "findReferences":
       return sendLspRequest(server, "textDocument/references", {
         textDocument: { uri },
         position: lspPos,
         context: { includeDeclaration: true },
-      });
+      }, reqOpts);
     case "hover":
       return sendLspRequest(server, "textDocument/hover", {
         textDocument: { uri },
         position: lspPos,
-      });
+      }, reqOpts);
     case "documentSymbol":
       return sendLspRequest(server, "textDocument/documentSymbol", {
         textDocument: { uri },
-      });
+      }, reqOpts);
     case "workspaceSymbol":
       return sendLspRequest(server, "workspace/symbol", {
         query: query ?? "",
-      });
+      }, reqOpts);
     case "goToImplementation":
       return sendLspRequest(server, "textDocument/implementation", {
         textDocument: { uri },
         position: lspPos,
-      });
+      }, reqOpts);
     case "prepareCallHierarchy":
       return sendLspRequest(server, "textDocument/prepareCallHierarchy", {
         textDocument: { uri },
         position: lspPos,
-      });
+      }, reqOpts);
     default:
       throw new Error(`Unsupported LSP operation: ${operation}`);
   }
 }
 
 export function getFileDiagnostics(filePath: string, cwd: string): string[] {
-  const absPath = path.isAbsolute(filePath) ? filePath : path.resolve(cwd, filePath);
-  const uri = `file://${absPath}`;
+  const absPath = normalizeFilePath(filePath, cwd);
+  const uri = toFileUri(absPath);
 
   for (const server of servers.values()) {
     const diags = server.diagnostics.get(uri);

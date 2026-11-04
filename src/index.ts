@@ -1,6 +1,11 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { executeLspOperation, getFileDiagnostics } from "./lsp-client.js";
+import {
+  executeLspOperation,
+  getFileDiagnostics,
+  shutdownAllServers,
+  normalizeFilePath,
+} from "./lsp-client.js";
 import { formatLspResult } from "./lsp-formatter.js";
 import { appendDiagnosticsToEditResult } from "./post-edit-diagnostics.js";
 
@@ -22,6 +27,9 @@ export default function opencodeLspExtension(pi: ExtensionAPI) {
     description:
       "Language Server Protocol code intelligence. Supports goToDefinition, findReferences, hover, documentSymbol, workspaceSymbol, goToImplementation, and prepareCallHierarchy.",
     promptSnippet: "Query symbol definitions, references, hover types, or workspace symbols",
+    promptGuidelines: [
+      "Use lsp for language-server symbol definitions, references, hover types, and call hierarchy instead of manual ripgrep or reading full files.",
+    ],
     parameters: Type.Object(
       {
         operation: Type.Union(
@@ -51,7 +59,7 @@ export default function opencodeLspExtension(pi: ExtensionAPI) {
       },
       { additionalProperties: false }
     ),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       const line = params.line ?? 1;
       const character = params.character ?? 1;
 
@@ -61,7 +69,8 @@ export default function opencodeLspExtension(pi: ExtensionAPI) {
           params.filePath,
           { line, character },
           ctx.cwd,
-          params.query
+          params.query,
+          signal
         );
         const formatted = formatLspResult(params.operation, raw, ctx.cwd);
         return {
@@ -72,6 +81,7 @@ export default function opencodeLspExtension(pi: ExtensionAPI) {
         return {
           content: [{ type: "text", text: `LSP error: ${err.message}` }],
           details: { error: err.message },
+          isError: true,
         };
       }
     },
@@ -79,6 +89,9 @@ export default function opencodeLspExtension(pi: ExtensionAPI) {
 
   // 2. Post-edit diagnostic hook: appends diagnostics to edit results without mutating systemPrompt
   pi.on("tool_result", async (event, ctx) => {
+    // Only check successful edits
+    if (event.isError) return;
+
     const isEditTool =
       event.toolName === "write" ||
       event.toolName === "edit" ||
@@ -86,18 +99,29 @@ export default function opencodeLspExtension(pi: ExtensionAPI) {
 
     if (!isEditTool || !event.input) return;
 
-    const targetPath = (event.input as any)?.path ?? (event.input as any)?.filePath;
-    if (!targetPath || typeof targetPath !== "string") return;
+    const rawPath = (event.input as any)?.path ?? (event.input as any)?.filePath;
+    if (!rawPath || typeof rawPath !== "string") return;
 
+    const targetPath = normalizeFilePath(rawPath, ctx.cwd);
     const diagnostics = getFileDiagnostics(targetPath, ctx.cwd);
     if (diagnostics.length === 0) return;
 
     if (Array.isArray(event.content)) {
-      for (const item of event.content) {
+      const updatedContent = event.content.map((item) => {
         if (item.type === "text" && typeof item.text === "string") {
-          item.text = appendDiagnosticsToEditResult(item.text, targetPath, diagnostics);
+          return {
+            ...item,
+            text: appendDiagnosticsToEditResult(item.text, rawPath, diagnostics),
+          };
         }
-      }
+        return item;
+      });
+      return { content: updatedContent };
     }
+  });
+
+  // 3. Process lifecycle: gracefully shut down all active LSP servers on session shutdown
+  pi.on("session_shutdown", async () => {
+    await shutdownAllServers();
   });
 }
