@@ -13,31 +13,64 @@ export function encodeRpcMessage(msg: JsonRpcMessage): string {
   return `Content-Length: ${length}\r\n\r\n${content}`;
 }
 
-export function parseRpcMessages(buffer: string): JsonRpcMessage[] {
+export interface ParseRpcResult {
+  messages: JsonRpcMessage[];
+  remainder: Buffer;
+}
+
+/**
+ * Robust, byte-aware parser for LSP JSON-RPC message streams.
+ * Handles Content-Length in bytes, UTF-8 multi-byte characters,
+ * partial frames across chunks, and returns unconsumed remainder.
+ */
+export function parseRpcBuffer(buffer: Buffer): ParseRpcResult {
   const messages: JsonRpcMessage[] = [];
-  let remaining = buffer;
+  let offset = 0;
 
-  while (true) {
-    const match = remaining.match(/Content-Length:\s*(\d+)\r\n\r\n/i);
-    if (!match || match.index === undefined) break;
-
-    const length = parseInt(match[1], 10);
-    const bodyStart = match.index + match[0].length;
-    const bodyEnd = bodyStart + length;
-
-    if (Buffer.byteLength(remaining.slice(bodyStart), "utf8") < length) {
-      break; // Incomplete message
+  while (offset < buffer.length) {
+    const headerEndIndex = buffer.indexOf("\r\n\r\n", offset);
+    if (headerEndIndex === -1) {
+      break; // Incomplete header
     }
 
-    const body = remaining.slice(bodyStart, bodyEnd);
+    const headerStr = buffer.toString("ascii", offset, headerEndIndex);
+    const match = headerStr.match(/Content-Length:\s*(\d+)/i);
+    if (!match) {
+      // Malformed header, advance past boundary to recover
+      offset = headerEndIndex + 4;
+      continue;
+    }
+
+    const contentLength = parseInt(match[1], 10);
+    const bodyStart = headerEndIndex + 4;
+    const bodyEnd = bodyStart + contentLength;
+
+    if (buffer.length < bodyEnd) {
+      // Incomplete body; wait for more data
+      break;
+    }
+
+    const bodyBuf = buffer.subarray(bodyStart, bodyEnd);
+    offset = bodyEnd;
+
     try {
-      messages.push(JSON.parse(body));
+      const parsed = JSON.parse(bodyBuf.toString("utf8"));
+      messages.push(parsed);
     } catch {
-      // ignore malformed
+      // Ignore malformed JSON
     }
-
-    remaining = remaining.slice(bodyEnd);
   }
 
-  return messages;
+  return {
+    messages,
+    remainder: offset > 0 ? buffer.subarray(offset) : buffer,
+  };
+}
+
+/**
+ * Legacy string-based parser kept for backward compatibility.
+ */
+export function parseRpcMessages(buffer: string): JsonRpcMessage[] {
+  const buf = Buffer.from(buffer, "utf8");
+  return parseRpcBuffer(buf).messages;
 }
