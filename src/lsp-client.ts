@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { pathToFileURL } from "node:url";
 import { encodeRpcMessage, parseRpcBuffer, type JsonRpcMessage } from "./json-rpc.js";
@@ -18,6 +19,7 @@ export interface ActiveServer {
   requestId: number;
   pendingRequests: Map<number, PendingRequest>;
   diagnostics: Map<string, LspDiagnostic[]>;
+  openedDocuments: Map<string, number>;
   buffer: Buffer;
   initialized: boolean;
 }
@@ -39,10 +41,12 @@ export function getActiveServersCount(): number {
 }
 
 function cleanupServer(key: string, active: ActiveServer) {
-  servers.delete(key);
+  if (servers.get(key) === active) {
+    servers.delete(key);
+  }
   for (const pending of active.pendingRequests.values()) {
     clearTimeout(pending.timer);
-    pending.resolve(null);
+    pending.reject(new Error("LSP server process closed"));
   }
   active.pendingRequests.clear();
 }
@@ -110,6 +114,7 @@ async function startServer(
         requestId: 1,
         pendingRequests: new Map(),
         diagnostics: new Map(),
+        openedDocuments: new Map(),
         buffer: Buffer.alloc(0),
         initialized: false,
       };
@@ -126,8 +131,16 @@ async function startServer(
 
       child.stdout?.on("data", (chunk: Buffer) => {
         active.buffer = Buffer.concat([active.buffer, chunk]);
-        const { messages, remainder } = parseRpcBuffer(active.buffer);
-        active.buffer = remainder;
+        let messages: JsonRpcMessage[];
+        try {
+          const parsed = parseRpcBuffer(active.buffer);
+          messages = parsed.messages;
+          active.buffer = parsed.remainder;
+        } catch {
+          cleanupServer(key, active);
+          child.kill();
+          return;
+        }
 
         for (const msg of messages) {
           if (msg.id !== undefined) {
@@ -137,7 +150,7 @@ async function startServer(
               active.pendingRequests.delete(reqId);
               clearTimeout(pending.timer);
               if (msg.error) {
-                pending.resolve(msg.error);
+                pending.reject(new Error(`LSP ${msg.error.code ?? "error"}: ${msg.error.message ?? "request failed"}`));
               } else {
                 pending.resolve(msg.result);
               }
@@ -178,7 +191,10 @@ async function startServer(
         { timeoutMs: initTimeoutMs }
       )
         .then((res) => {
-          if (!res && child.killed) {
+          // LSP InitializeResult is an object. Null indicates timeout or closed stdin.
+          if (!res || typeof res !== "object" || child.exitCode !== null || child.signalCode !== null) {
+            child.kill();
+            cleanupServer(key, active);
             safeResolve(undefined);
             return;
           }
@@ -188,6 +204,8 @@ async function startServer(
           safeResolve(active);
         })
         .catch(() => {
+          child.kill();
+          cleanupServer(key, active);
           safeResolve(undefined);
         });
     } catch {
@@ -292,11 +310,12 @@ export async function shutdownServer(server: ActiveServer): Promise<void> {
   } catch {}
 
   try {
-    if (!server.process.killed) {
+    if (server.process.exitCode === null && server.process.signalCode === null) {
       server.process.kill("SIGTERM");
       setTimeout(() => {
         try {
-          if (!server.process.killed) {
+          // ChildProcess.killed means a signal was sent, not that it exited.
+          if (server.process.exitCode === null && server.process.signalCode === null) {
             server.process.kill("SIGKILL");
           }
         } catch {}
@@ -333,6 +352,10 @@ export async function executeLspOperation(
   const uri = toFileUri(absPath);
   const lspPos = translatePosition(pos);
   const reqOpts = { signal };
+
+  if (operation !== "workspaceSymbol") {
+    await synchronizeDocument(server, absPath);
+  }
 
   switch (operation) {
     case "goToDefinition":
@@ -372,6 +395,55 @@ export async function executeLspOperation(
     default:
       throw new Error(`Unsupported LSP operation: ${operation}`);
   }
+}
+
+const LANGUAGE_IDS: Record<string, string> = {
+  ".ts": "typescript",
+  ".tsx": "typescriptreact",
+  ".js": "javascript",
+  ".jsx": "javascriptreact",
+  ".py": "python",
+  ".rs": "rust",
+  ".go": "go",
+  ".c": "c",
+  ".cpp": "cpp",
+};
+
+export function getLanguageId(filePath: string): string {
+  const ext = path.extname(filePath).toLowerCase();
+  return LANGUAGE_IDS[ext] ?? ext.replace(/^\./, "");
+}
+
+async function synchronizeDocument(server: ActiveServer, absPath: string): Promise<void> {
+  const uri = toFileUri(absPath);
+  let text: string;
+  try {
+    text = await fs.readFile(absPath, "utf8");
+  } catch {
+    return; // File unreadable or does not exist yet; proceed directly
+  }
+
+  const version = server.openedDocuments.get(uri);
+
+  if (version === undefined) {
+    sendNotification(server, "textDocument/didOpen", {
+      textDocument: {
+        uri,
+        languageId: getLanguageId(absPath),
+        version: 1,
+        text,
+      },
+    });
+    server.openedDocuments.set(uri, 1);
+    return;
+  }
+
+  const nextVersion = version + 1;
+  sendNotification(server, "textDocument/didChange", {
+    textDocument: { uri, version: nextVersion },
+    contentChanges: [{ text }],
+  });
+  server.openedDocuments.set(uri, nextVersion);
 }
 
 export function getFileDiagnostics(filePath: string, cwd: string): string[] {

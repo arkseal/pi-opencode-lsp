@@ -6,6 +6,7 @@ import {
   toFileUri,
   sendLspRequest,
   shutdownAllServers,
+  getLanguageId,
   type ActiveServer,
 } from "../src/lsp-client";
 import { EventEmitter } from "node:events";
@@ -162,6 +163,7 @@ describe("LSP Client & Formatter", () => {
       requestId: 10,
       pendingRequests: new Map(),
       diagnostics: new Map(),
+      openedDocuments: new Map(),
       buffer: Buffer.alloc(0),
       initialized: true,
     };
@@ -183,5 +185,24 @@ describe("LSP Client & Formatter", () => {
 
   it("shuts down all active servers gracefully", async () => {
     await shutdownAllServers();
+  });
+
+  it("maps file extensions to standard LSP language IDs", () => {
+    expect(getLanguageId("app.ts")).toBe("typescript");
+    expect(getLanguageId("component.tsx")).toBe("typescriptreact");
+    expect(getLanguageId("index.js")).toBe("javascript");
+    expect(getLanguageId("script.py")).toBe("python");
+    expect(getLanguageId("main.rs")).toBe("rust");
+    expect(getLanguageId("server.go")).toBe("go");
+    expect(getLanguageId("main.cpp")).toBe("cpp");
+    expect(getLanguageId("other.custom")).toBe("custom");
+  });
+
+  it("throws when RPC header or body exceeds safety limits", () => {
+    const hugeHeader = Buffer.from("X-Bogus-Header: " + "a".repeat(20 * 1024));
+    expect(() => parseRpcBuffer(hugeHeader)).toThrow("LSP JSON-RPC header exceeds maximum size");
+
+    const hugeBodyMsg = Buffer.from("Content-Length: 50000000\r\n\r\n");
+    expect(() => parseRpcBuffer(hugeBodyMsg)).toThrow("LSP JSON-RPC body exceeds maximum size");
   });
 });

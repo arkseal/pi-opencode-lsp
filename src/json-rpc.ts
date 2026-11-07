@@ -23,6 +23,9 @@ export interface ParseRpcResult {
  * Handles Content-Length in bytes, UTF-8 multi-byte characters,
  * partial frames across chunks, and returns unconsumed remainder.
  */
+const MAX_RPC_HEADER_BYTES = 16 * 1024;
+const MAX_RPC_BODY_BYTES = 32 * 1024 * 1024;
+
 export function parseRpcBuffer(buffer: Buffer): ParseRpcResult {
   const messages: JsonRpcMessage[] = [];
   let offset = 0;
@@ -30,7 +33,13 @@ export function parseRpcBuffer(buffer: Buffer): ParseRpcResult {
   while (offset < buffer.length) {
     const headerEndIndex = buffer.indexOf("\r\n\r\n", offset);
     if (headerEndIndex === -1) {
+      if (buffer.length - offset > MAX_RPC_HEADER_BYTES) {
+        throw new Error("LSP JSON-RPC header exceeds maximum size");
+      }
       break; // Incomplete header
+    }
+    if (headerEndIndex - offset > MAX_RPC_HEADER_BYTES) {
+      throw new Error("LSP JSON-RPC header exceeds maximum size");
     }
 
     const headerStr = buffer.toString("ascii", offset, headerEndIndex);
@@ -42,6 +51,9 @@ export function parseRpcBuffer(buffer: Buffer): ParseRpcResult {
     }
 
     const contentLength = parseInt(match[1], 10);
+    if (!Number.isSafeInteger(contentLength) || contentLength < 0 || contentLength > MAX_RPC_BODY_BYTES) {
+      throw new Error("LSP JSON-RPC body exceeds maximum size");
+    }
     const bodyStart = headerEndIndex + 4;
     const bodyEnd = bodyStart + contentLength;
 
